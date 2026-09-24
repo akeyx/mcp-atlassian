@@ -66,6 +66,12 @@ def _append_text_nodes(
         nodes.append(node)
 
 
+# ADF's "code" mark excludes these per Atlassian's schema (subsup and
+# textColor/underline aren't produced by this converter at all, so only
+# the three actually reachable here are listed).
+_CODE_INCOMPATIBLE_MARKS = frozenset({"em", "strong", "strike"})
+
+
 def _apply_mark(
     nodes: list[dict[str, Any]], mark: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -75,9 +81,27 @@ def _apply_mark(
     ``status``) are left untouched rather than getting an invalid marks
     array. Skips adding a duplicate if the node already has a mark of the
     same type (can happen when recursively nesting the same style twice).
+
+    Also skips adding ``em``/``strong``/``strike`` to a node that already
+    has a ``code`` mark: ADF's schema declares those mutually exclusive
+    with ``code`` on the same text node, and Jira Cloud's API rejects the
+    whole request with ``INVALID_INPUT`` if they're combined -- not a
+    silent rendering glitch, a hard failure. This can only happen through
+    recursive nesting (e.g. bold wrapping a code span, ``**foo `bar`
+    baz**``): the outer ``strong`` mark gets layered on top of whatever
+    the recursive parse produced, including the code-marked node for
+    `` `bar` ``. Dropping the incompatible mark on just that node (while
+    the surrounding plain-text segments still get it) is the correct
+    outcome anyway -- Jira renders code spans in fixed monospace regardless
+    of any emphasis mark, so there was never a visual difference to lose.
     """
     for node in nodes:
         if node.get("type") != "text":
+            continue
+        existing_marks = node.get("marks") or []
+        if mark["type"] in _CODE_INCOMPATIBLE_MARKS and any(
+            m.get("type") == "code" for m in existing_marks
+        ):
             continue
         marks = node.setdefault("marks", [])
         if not any(m.get("type") == mark["type"] for m in marks):
@@ -92,6 +116,29 @@ def _apply_marks(
     for mark in marks:
         _apply_mark(nodes, mark)
     return nodes
+
+
+_WORD_FLANKED_UNDERSCORE_RE = re.compile(r"[A-Za-z0-9]_[A-Za-z0-9]")
+
+
+def _looks_like_embedded_identifier(text: str) -> bool:
+    """True if ``text`` contains an underscore sandwiched between two word
+    characters, e.g. ``some_variable``.
+
+    Used to reject a single-underscore italic match whose captured span
+    accidentally bridged over an unrelated identifier instead of wrapping a
+    short, intentional phrase. This happens when some other token on the
+    same line has a genuinely word-boundary-safe underscore (a leading
+    underscore like ``_todo``, or a trailing one like ``rename_it_``) that
+    the lazy ``.+?`` quantifier can pair up with across everything in
+    between, e.g. ``Set _todo for later, then call some_helper_func, then
+    rename it_ tomorrow.`` would otherwise italicize the entire middle
+    span and eat the trailing underscore off an unrelated identifier. A
+    real intentional italic phrase is virtually never going to contain
+    what looks like its own embedded identifier, so this is a safe,
+    narrow reject condition.
+    """
+    return bool(_WORD_FLANKED_UNDERSCORE_RE.search(text))
 
 
 def _parse_nested(
@@ -279,11 +326,18 @@ def _parse_inline_formatting(
                 _parse_nested(m.group("italic_inner"), jira_base_url, [{"type": "em"}])
             )
         elif m.group("italic_us_inner") is not None:
-            nodes.extend(
-                _parse_nested(
-                    m.group("italic_us_inner"), jira_base_url, [{"type": "em"}]
-                )
-            )
+            inner = m.group("italic_us_inner")
+            if _looks_like_embedded_identifier(inner):
+                # This span's own delimiters are individually valid (each
+                # passed the word-boundary guard), but the middle contains
+                # what looks like an unrelated identifier's underscore --
+                # almost certainly an accidental bridge across two
+                # unconnected tokens rather than an intentional italic
+                # phrase. Preserve the whole thing literally, delimiters
+                # included, instead of guessing wrong.
+                _append_text_nodes(nodes, m.group(0), jira_base_url)
+            else:
+                nodes.extend(_parse_nested(inner, jira_base_url, [{"type": "em"}]))
 
         pos = m.end()
 

@@ -517,6 +517,58 @@ class TestMarkdownToAdf:
         mark_types = {m["type"] for m in key_node.get("marks", [])}
         assert mark_types == {"link", "strong"}
 
+    def test_bold_wrapping_code_span_does_not_add_strong_to_code_node(self):
+        """Bold wrapping an inline code span (e.g. "**foo `code` bar**")
+        must not put a strong mark on the code-marked node. ADF's schema
+        declares code mutually exclusive with strong/em/strike on the same
+        text node, and Jira Cloud's API rejects the whole request with
+        INVALID_INPUT if they're combined. The surrounding plain text
+        still gets the outer mark; only the code node is exempted."""
+        result = markdown_to_adf("**foo `code` bar**")
+        para = result["content"][0]
+        code_node = next(
+            n
+            for n in para["content"]
+            if any(m["type"] == "code" for m in n.get("marks", []))
+        )
+        assert {m["type"] for m in code_node["marks"]} == {"code"}
+        plain_nodes = [n for n in para["content"] if n is not code_node]
+        assert all(
+            any(m["type"] == "strong" for m in n.get("marks", [])) for n in plain_nodes
+        )
+
+    def test_underscore_bridge_over_embedded_identifier_stays_literal(self):
+        """A genuinely word-boundary-valid underscore elsewhere on the line
+        (leading `_todo`, trailing `it_`) must not let the lazy quantifier
+        bridge across and swallow an unrelated identifier
+        (`some_helper_func`) in between as italic content, eating both
+        delimiter underscores in the process. The whole line must come
+        back completely unmarked -- no partial italic, no dropped
+        underscores."""
+        md = (
+            "Set _todo for later, then call some_helper_func, then rename it_ tomorrow."
+        )
+        result = markdown_to_adf(md)
+        para = result["content"][0]
+        combined_text = "".join(n["text"] for n in para["content"])
+        assert combined_text == md
+        assert not any(n.get("marks") for n in para["content"])
+
+    def test_genuine_underscore_italic_unaffected_by_bridge_guard(self):
+        """The bridge guard above must not swallow real, isolated italic
+        usage that happens to share a line with an unrelated identifier."""
+        result = markdown_to_adf(
+            "Some_identifier and another_one are fine; this is _important_ though."
+        )
+        para = result["content"][0]
+        em_nodes = [
+            n
+            for n in para["content"]
+            if any(m["type"] == "em" for m in n.get("marks", []))
+        ]
+        assert len(em_nodes) == 1
+        assert em_nodes[0]["text"] == "important"
+
     def test_inline_code(self):
         """`code` text gets a code mark."""
         result = markdown_to_adf("`code`")
