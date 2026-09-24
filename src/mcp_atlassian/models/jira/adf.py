@@ -66,12 +66,34 @@ def _append_text_nodes(
         nodes.append(node)
 
 
+_LOOKS_LIKE_URL_RE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*://|mailto:|/|#|\.\.?/)")
+
+
+def _looks_like_url(href: str) -> bool:
+    """True if ``href`` looks like an actual URL/path rather than
+    coincidental prose that happens to sit inside parens right after a
+    bracketed phrase.
+
+    ``[text](href)`` is only treated as a real link when ``href`` has a URL
+    scheme (``https://``, ``mailto:``, ...) or looks like a path (``/...``,
+    ``#...``, ``./...``). Without this check, ordinary prose like
+    ``[note](not a url, just a parenthetical)`` -- a bracketed phrase
+    immediately followed by an unrelated parenthetical with zero
+    intervening whitespace -- gets misread as a link whose href is
+    nonsense text, and the brackets effectively disappear visually since
+    Jira just renders it as plain link-styled text with no visible
+    brackets.
+    """
+    return bool(_LOOKS_LIKE_URL_RE.match(href.strip()))
+
+
 def _parse_inline_formatting(
     text: str, jira_base_url: str = ""
 ) -> list[dict[str, Any]]:
     """Parse inline Markdown formatting into ADF inline nodes.
 
-    Handles: bold (**), italic (*), inline code (`), links ([text](url)),
+    Handles: bold (**), italic (*), inline code (`), links ([text](url))
+    including legacy Jira/Confluence wiki-style links ([text|url]),
     strikethrough (~~), Jira-flavored user mentions
     ([~accountid:ACCOUNT_ID] or @[Display Name](accountid:ACCOUNT_ID)), and
     status lozenges ({status:color=green|title=Done}).
@@ -102,7 +124,13 @@ def _parse_inline_formatting(
     nodes: list[dict[str, Any]] = []
     # Pattern order matters: mention before link, bold before italic,
     # code before others. Status sits after code so a backticked
-    # `{status:...}` stays literal.
+    # `{status:...}` stays literal. The italic pattern requires the
+    # opening `*` to not be followed by whitespace and the closing `*` to
+    # not be preceded by whitespace (CommonMark's actual flanking rule,
+    # previously missing here): without it, two unrelated standalone
+    # asterisks on the same line -- e.g. a glob/wildcard convention like
+    # "name_* and other_* were affected" -- can pair up and swallow
+    # everything in between as an accidental italic span.
     inline_re = re.compile(
         r"\[~accountid:(?P<wiki_mention_id>[^\]]+)\]"
         r"|@\[(?P<display_mention_text>[^\]]+)\]"
@@ -113,7 +141,8 @@ def _parse_inline_formatting(
         r"|\*\*(?P<bold_inner>.+?)\*\*"
         r"|~~(?P<strike_inner>.+?)~~"
         r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
-        r"|(?<!\*)\*(?!\*)(?P<italic_inner>.+?)(?<!\*)\*(?!\*)"
+        r"|\[(?P<wikilink_text>[^\]|]+)\|(?P<wikilink_href>[^\]]+)\]"
+        r"|(?<!\*)\*(?!\*)(?!\s)(?P<italic_inner>.+?)(?<!\s)(?<!\*)\*(?!\*)"
     )
 
     pos = 0
@@ -177,18 +206,48 @@ def _parse_inline_formatting(
                 [{"type": "strike"}],
             )
         elif m.group("link_text") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("link_text"),
-                    "marks": [
-                        {
-                            "type": "link",
-                            "attrs": {"href": m.group("link_href")},
-                        }
-                    ],
-                }
-            )
+            href = m.group("link_href")
+            if _looks_like_url(href):
+                nodes.append(
+                    {
+                        "type": "text",
+                        "text": m.group("link_text"),
+                        "marks": [
+                            {
+                                "type": "link",
+                                "attrs": {"href": href},
+                            }
+                        ],
+                    }
+                )
+            else:
+                # Doesn't look like a real link target -- almost certainly
+                # a bracketed phrase immediately followed by an unrelated
+                # parenthetical, not markdown link syntax. Preserve both
+                # parts literally (still recursing into the bracket text
+                # for any other inline formatting it might contain)
+                # instead of producing a link to nonsense.
+                _append_text_nodes(nodes, "[", jira_base_url)
+                nodes.extend(
+                    _parse_inline_formatting(m.group("link_text"), jira_base_url)
+                )
+                _append_text_nodes(nodes, f"]({href})", jira_base_url)
+        elif m.group("wikilink_text") is not None:
+            # Legacy Jira/Confluence wiki syntax: [Display Text|url]. Common
+            # in content authored before this converter existed, so worth
+            # recognizing directly instead of requiring it to be manually
+            # rewritten to Markdown link syntax first.
+            wiki_href = m.group("wikilink_href")
+            if _looks_like_url(wiki_href):
+                nodes.append(
+                    {
+                        "type": "text",
+                        "text": m.group("wikilink_text"),
+                        "marks": [{"type": "link", "attrs": {"href": wiki_href}}],
+                    }
+                )
+            else:
+                _append_text_nodes(nodes, m.group(0), jira_base_url)
         elif m.group("italic_inner") is not None:
             _append_text_nodes(
                 nodes,
