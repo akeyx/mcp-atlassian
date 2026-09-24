@@ -66,15 +66,73 @@ def _append_text_nodes(
         nodes.append(node)
 
 
+def _apply_mark(
+    nodes: list[dict[str, Any]], mark: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Add ``mark`` to every text node in ``nodes``, in place.
+
+    Node types that don't carry marks in the ADF schema (``mention``,
+    ``status``) are left untouched rather than getting an invalid marks
+    array. Skips adding a duplicate if the node already has a mark of the
+    same type (can happen when recursively nesting the same style twice).
+    """
+    for node in nodes:
+        if node.get("type") != "text":
+            continue
+        marks = node.setdefault("marks", [])
+        if not any(m.get("type") == mark["type"] for m in marks):
+            marks.append(mark)
+    return nodes
+
+
+def _apply_marks(
+    nodes: list[dict[str, Any]], marks: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Apply multiple marks (see :func:`_apply_mark`) to every text node."""
+    for mark in marks:
+        _apply_mark(nodes, mark)
+    return nodes
+
+
+def _parse_nested(
+    text: str, jira_base_url: str, marks: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Recursively parse ``text`` for inline formatting, then add ``marks``
+    on top of whatever the recursion produced.
+
+    This is what lets emphasis nest -- e.g. the italic inside
+    ``**_bold italic_**`` is recognized by the recursive call, and the
+    outer ``strong`` mark is then layered onto that result, instead of the
+    outer match swallowing the inner markers as literal text. Issue-key
+    autolinking and any other inline pattern inside the span still runs
+    normally since it goes through the same ``_parse_inline_formatting``
+    entry point.
+    """
+    return _apply_marks(_parse_inline_formatting(text, jira_base_url), marks)
+
+
 def _parse_inline_formatting(
     text: str, jira_base_url: str = ""
 ) -> list[dict[str, Any]]:
     """Parse inline Markdown formatting into ADF inline nodes.
 
-    Handles: bold (**), italic (*), inline code (`), links ([text](url)),
-    strikethrough (~~), Jira-flavored user mentions
-    ([~accountid:ACCOUNT_ID] or @[Display Name](accountid:ACCOUNT_ID)), and
-    status lozenges ({status:color=green|title=Done}).
+    Handles: bold (**), italic (* or single _), combined bold+italic (***
+    or ___), inline code (`), links ([text](url)), strikethrough (~~),
+    Jira-flavored user mentions ([~accountid:ACCOUNT_ID] or
+    @[Display Name](accountid:ACCOUNT_ID)), and status lozenges
+    ({status:color=green|title=Done}). Emphasis nests recursively, so
+    `**_bold italic_**` (or any other combination of the above) applies
+    both marks correctly instead of the outer match swallowing the inner
+    markers as literal text.
+
+    Single-underscore italic requires a CommonMark-style word boundary on
+    both sides (the `_` cannot be directly adjacent to a letter, digit, or
+    another `_`), so `my_variable_name` stays fully literal instead of
+    partially italicizing -- this is what makes plain identifiers safe
+    without needing a code span. Double-underscore bold (`__text__`) is
+    deliberately not supported: `**` already covers bold, and adding a
+    second bold syntax would only add another way to get the boundary
+    rule subtly wrong for no real benefit.
 
     Bare Jira issue keys are converted to links when ``jira_base_url`` is set.
 
@@ -102,7 +160,17 @@ def _parse_inline_formatting(
     nodes: list[dict[str, Any]] = []
     # Pattern order matters: mention before link, bold before italic,
     # code before others. Status sits after code so a backticked
-    # `{status:...}` stays literal.
+    # `{status:...}` stays literal. The triple-marker bold+italic
+    # alternatives sit before the plain bold pattern so "***x***"/"___x___"
+    # are consumed whole instead of bold eating two of the three markers
+    # and leaking the third one as literal text. Code sitting before the
+    # underscore-italic pattern is also what keeps underscores inside a
+    # code span (`my_code_here`) untouched: the code alternative consumes
+    # the whole backticked span in one match, so the scanner never visits
+    # those underscores as candidate emphasis delimiters -- the
+    # word-boundary guards on the underscore-italic pattern itself are
+    # what protect plain-text identifiers like my_var_name that are NOT
+    # inside a code span.
     inline_re = re.compile(
         r"\[~accountid:(?P<wiki_mention_id>[^\]]+)\]"
         r"|@\[(?P<display_mention_text>[^\]]+)\]"
@@ -110,10 +178,13 @@ def _parse_inline_formatting(
         r"|`(?P<code_inner>[^`]+)`"
         r"|\{status:(?:color=(?P<status_color>\w+)\|)?"
         r"title=(?P<status_title>[^}]+)\}"
+        r"|\*\*\*(?P<bolditalic_star_inner>.+?)\*\*\*"
+        r"|___(?P<bolditalic_us_inner>.+?)___"
         r"|\*\*(?P<bold_inner>.+?)\*\*"
         r"|~~(?P<strike_inner>.+?)~~"
         r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
         r"|(?<!\*)\*(?!\*)(?P<italic_inner>.+?)(?<!\*)\*(?!\*)"
+        r"|(?<![A-Za-z0-9_])_(?!_)(?P<italic_us_inner>.+?)(?<!_)_(?![A-Za-z0-9_])"
     )
 
     pos = 0
@@ -162,19 +233,33 @@ def _parse_inline_formatting(
                     },
                 }
             )
+        elif m.group("bolditalic_star_inner") is not None:
+            nodes.extend(
+                _parse_nested(
+                    m.group("bolditalic_star_inner"),
+                    jira_base_url,
+                    [{"type": "strong"}, {"type": "em"}],
+                )
+            )
+        elif m.group("bolditalic_us_inner") is not None:
+            nodes.extend(
+                _parse_nested(
+                    m.group("bolditalic_us_inner"),
+                    jira_base_url,
+                    [{"type": "strong"}, {"type": "em"}],
+                )
+            )
         elif m.group("bold_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("bold_inner"),
-                jira_base_url,
-                [{"type": "strong"}],
+            nodes.extend(
+                _parse_nested(
+                    m.group("bold_inner"), jira_base_url, [{"type": "strong"}]
+                )
             )
         elif m.group("strike_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("strike_inner"),
-                jira_base_url,
-                [{"type": "strike"}],
+            nodes.extend(
+                _parse_nested(
+                    m.group("strike_inner"), jira_base_url, [{"type": "strike"}]
+                )
             )
         elif m.group("link_text") is not None:
             nodes.append(
@@ -190,11 +275,14 @@ def _parse_inline_formatting(
                 }
             )
         elif m.group("italic_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("italic_inner"),
-                jira_base_url,
-                [{"type": "em"}],
+            nodes.extend(
+                _parse_nested(m.group("italic_inner"), jira_base_url, [{"type": "em"}])
+            )
+        elif m.group("italic_us_inner") is not None:
+            nodes.extend(
+                _parse_nested(
+                    m.group("italic_us_inner"), jira_base_url, [{"type": "em"}]
+                )
             )
 
         pos = m.end()
