@@ -630,6 +630,72 @@ class TestMarkdownToAdf:
         assert len(ordered_lists) == 1
         assert len(ordered_lists[0]["content"]) == 3
 
+    @pytest.mark.parametrize(
+        "md",
+        [
+            "- alpha\n\n- beta\n\n- gamma",
+            "* alpha\n\n* beta\n\n* gamma",
+        ],
+    )
+    def test_bullet_list_with_blank_lines(self, md: str) -> None:
+        """Blank lines between items keep one loose bullet list (mirrors
+        the ordered-list case above -- previously each item became its own
+        single-item bulletList, e.g. GitHub #1695)."""
+        result = markdown_to_adf(md)
+        bullet_lists = [
+            node for node in result["content"] if node["type"] == "bulletList"
+        ]
+        assert len(bullet_lists) == 1
+        assert len(bullet_lists[0]["content"]) == 3
+
+    def test_nested_bullet_list(self) -> None:
+        """Indented bullet items nest under the preceding item instead of
+        falling through to literal paragraph text (GitHub #1129)."""
+        md = "* Fruits\n  * Apples\n  * Bananas"
+        result = markdown_to_adf(md)
+        assert len(result["content"]) == 1
+        top = result["content"][0]
+        assert top["type"] == "bulletList"
+        assert len(top["content"]) == 1
+        fruits_item = top["content"][0]
+        assert fruits_item["content"][0]["type"] == "paragraph"
+        nested = fruits_item["content"][1]
+        assert nested["type"] == "bulletList"
+        nested_texts = [
+            item["content"][0]["content"][0]["text"] for item in nested["content"]
+        ]
+        assert nested_texts == ["Apples", "Bananas"]
+
+    def test_nested_list_mixed_ordered_then_unordered(self) -> None:
+        """An ordered parent can nest an unordered child list."""
+        md = "1. Fruits\n   - Apples\n   - Bananas\n2. Vegetables"
+        result = markdown_to_adf(md)
+        top = result["content"][0]
+        assert top["type"] == "orderedList"
+        assert len(top["content"]) == 2
+        fruits_item = top["content"][0]
+        nested = fruits_item["content"][1]
+        assert nested["type"] == "bulletList"
+        assert len(nested["content"]) == 2
+
+    def test_nested_list_three_levels(self) -> None:
+        """Nesting recurses beyond a single level."""
+        md = "- A\n  - B\n    - C"
+        result = markdown_to_adf(md)
+        level1 = result["content"][0]["content"][0]
+        level2 = level1["content"][1]["content"][0]
+        level3 = level2["content"][1]["content"][0]
+        assert level3["content"][0]["content"][0]["text"] == "C"
+
+    def test_nested_list_tab_indent(self) -> None:
+        """A tab is treated as four spaces of indent for nesting purposes."""
+        md = "- A\n\t- B"
+        result = markdown_to_adf(md)
+        top_item = result["content"][0]["content"][0]
+        nested = top_item["content"][1]
+        assert nested["type"] == "bulletList"
+        assert nested["content"][0]["content"][0]["content"][0]["text"] == "B"
+
     def test_task_list_checked(self):
         """- [x] items produce a taskList with taskItem state=DONE."""
         md = "- [x] done task"
