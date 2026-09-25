@@ -247,7 +247,16 @@ def _parse_inline_formatting(
                     }
                 )
             else:
-                _append_text_nodes(nodes, m.group(0), jira_base_url)
+                # href doesn't look like a URL -- preserve the brackets
+                # and pipe literally, but still recurse into the display
+                # text for any other inline formatting it might contain,
+                # rather than flattening the whole thing (including any
+                # nested markdown) to plain text.
+                _append_text_nodes(nodes, "[", jira_base_url)
+                nodes.extend(
+                    _parse_inline_formatting(m.group("wikilink_text"), jira_base_url)
+                )
+                _append_text_nodes(nodes, f"|{wiki_href}]", jira_base_url)
         elif m.group("italic_inner") is not None:
             _append_text_nodes(
                 nodes,

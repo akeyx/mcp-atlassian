@@ -549,6 +549,25 @@ class TestMarkdownToAdf:
         combined_text = "".join(n["text"] for n in para["content"])
         assert combined_text == "the value is [name|value] pair"
 
+    def test_bracket_pipe_rejection_still_processes_embedded_formatting(self):
+        """When the wikilink pattern's href doesn't look like a URL, the
+        display text is still recursed into for its own inline formatting
+        instead of the whole thing being flattened to plain text."""
+        result = markdown_to_adf("the value is [**name**|value] pair")
+        para = result["content"][0]
+        assert not any(
+            any(m["type"] == "link" for m in n.get("marks", []))
+            for n in para["content"]
+        )
+        bold_node = next(
+            n
+            for n in para["content"]
+            if any(m["type"] == "strong" for m in n.get("marks", []))
+        )
+        assert bold_node["text"] == "name"
+        combined_text = "".join(n["text"] for n in para["content"])
+        assert combined_text == "the value is [name|value] pair"
+
     # -- Mentions -----------------------------------------------------------
 
     def test_mention_modern_account_id(self):
