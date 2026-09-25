@@ -333,9 +333,18 @@ def _parse_inline_formatting(
                 # what looks like an unrelated identifier's underscore --
                 # almost certainly an accidental bridge across two
                 # unconnected tokens rather than an intentional italic
-                # phrase. Preserve the whole thing literally, delimiters
-                # included, instead of guessing wrong.
-                _append_text_nodes(nodes, m.group(0), jira_base_url)
+                # phrase. Preserve the two delimiter underscores literally,
+                # but still recurse into the swallowed span for its own
+                # inline formatting -- it can easily contain a genuine
+                # markdown construct (a real link, bold text, etc.) that
+                # must not be flattened to plain text just because the
+                # outer italic guess was wrong. Recursing on `inner` alone
+                # (not the full match, which still has the delimiters
+                # attached) keeps this from re-triggering the same
+                # rejection forever.
+                _append_text_nodes(nodes, "_", jira_base_url)
+                nodes.extend(_parse_inline_formatting(inner, jira_base_url))
+                _append_text_nodes(nodes, "_", jira_base_url)
             else:
                 nodes.extend(_parse_nested(inner, jira_base_url, [{"type": "em"}]))
 

@@ -569,6 +569,30 @@ class TestMarkdownToAdf:
         assert len(em_nodes) == 1
         assert em_nodes[0]["text"] == "important"
 
+    def test_underscore_bridge_rejection_still_processes_embedded_link(self):
+        """When the underscore-bridge guard rejects a false italic match,
+        it must still recurse into the swallowed span for any genuine
+        markdown it contains -- e.g. a real [text](url) link -- instead of
+        flattening everything (including the link syntax) to plain
+        literal text."""
+        md = "_Note: see [a link](https://example.com/thing_here) for details_ here."
+        result = markdown_to_adf(md)
+        para = result["content"][0]
+        link_node = next(
+            n
+            for n in para["content"]
+            if any(m["type"] == "link" for m in n.get("marks", []))
+        )
+        assert link_node["text"] == "a link"
+        link_mark = next(m for m in link_node["marks"] if m["type"] == "link")
+        assert link_mark["attrs"]["href"] == "https://example.com/thing_here"
+        assert not any(m["type"] == "em" for m in link_node.get("marks", []))
+        underscore_nodes = [n for n in para["content"] if n["text"] == "_"]
+        assert len(underscore_nodes) == 2
+        assert not any(
+            m["type"] == "em" for n in para["content"] for m in n.get("marks", [])
+        )
+
     def test_inline_code(self):
         """`code` text gets a code mark."""
         result = markdown_to_adf("`code`")
